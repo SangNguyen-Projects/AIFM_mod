@@ -14,6 +14,8 @@ extern "C" {
 #include <random>
 #include <string>
 
+#include <sstream>
+
 using namespace far_memory;
 using namespace std;
 
@@ -84,12 +86,29 @@ fail:
 int argc;
 void _main(void *arg) {
   char **argv = static_cast<char **>(arg);
-  std::string ip_addr_port(argv[1]);
-  auto raddr = helpers::str_to_netaddr(ip_addr_port);
+  
+  // argv[1] now contains a comma-separated list of IPs: "IP1:PORT,IP2:PORT"
+  std::string ip_addrs_str(argv[1]); 
+  
+  std::vector<FarMemDevice*> cluster_devices;
+  std::stringstream ss(ip_addrs_str);
+  std::string single_ip_port;
+
+  // Split the string by commas and build a TCPDevice for each node
+  while (std::getline(ss, single_ip_port, ',')) {
+    if (!single_ip_port.empty()) {
+      auto raddr = helpers::str_to_netaddr(single_ip_port);
+      // Create a device connection for this specific memory node
+      cluster_devices.push_back(new TCPDevice(raddr, kNumConnections, kFarMemSize));
+      std::cout << "Connected to memory node: " << single_ip_port << std::endl;
+    }
+  }
+
+  // Pass the entire cluster array to the Manager Factory
   std::unique_ptr<FarMemManager> manager =
       std::unique_ptr<FarMemManager>(FarMemManagerFactory::build(
-          kCacheSize, kNumGCThreads,
-          new TCPDevice(raddr, kNumConnections, kFarMemSize)));
+          kCacheSize, kNumGCThreads, cluster_devices));
+
   do_work(manager.get());
 }
 

@@ -1,10 +1,19 @@
-MEM_SERVER_SSH_IP=128.110.154.181
-MEM_SERVER_SSH_USER=zainruan
+NODE_IPS=("128.110.218.62:sangbob" "128.110.218.54:sangbob" "128.110.218.53:sangbob")
 
 function ssh_execute {
-    ssh $MEM_SERVER_SSH_USER@$MEM_SERVER_SSH_IP $1
+    local index=$1
+    local cmd=$2
+    local node=${NODE_IPS[$index]}
+    local ip=${node%:*}
+    local user=${node#*:}
+    ssh $user@$ip "$cmd"
 }
 
 function ssh_execute_tty {
-    ssh $MEM_SERVER_SSH_USER@$MEM_SERVER_SSH_IP -t $1
+    local index=$1
+    local cmd=$2
+    local node=${NODE_IPS[$index]}
+    local ip=${node%:*}
+    local user=${node#*:}
+    ssh $user@$ip -t "$cmd"
 }

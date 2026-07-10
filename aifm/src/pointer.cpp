@@ -44,14 +44,15 @@ void FarMemPtrMeta::gc_copy(uint64_t new_local_object_addr) {
 }
 
 void FarMemPtrMeta::gc_wb(uint8_t ds_id, uint16_t object_size,
-                          uint64_t obj_id) {
-  assert(obj_id < (1ULL << kObjectIDBitSize));
+                          const std::vector<ReplicaLocation>& new_replicas) {
   auto new_metadata =
       (obj_id << kObjectIDBitPos) |
       (static_cast<uint64_t>(object_size) << kObjectSizeBitPos) |
       kPresentClear | ds_id;
   new_metadata |= (static_cast<uint64_t>(is_shared()) << kSharedBitPos);
   from_uint64_t(new_metadata);
+
+  replicas_ = new_replicas;
 }
 
 void GenericFarMemPtr::swap_in(bool nt) {
@@ -130,9 +131,19 @@ restart:
       }
     }
 
-    FarMemManagerFactory::get()->get_device()->write_object(
+    //FarMemManagerFactory::get()->get_device()->write_object(
+    //    obj.get_ds_id(), obj_id_len, obj_id_ptr, obj.get_data_len(),
+    //    reinterpret_cast<const uint8_t *>(obj.get_data_addr()));
+
+    // 1. Fire the simultaneous quorum write
+    auto new_replicas = FarMemManagerFactory::get()->write_object_quorum(
         obj.get_ds_id(), obj_id_len, obj_id_ptr, obj.get_data_len(),
         reinterpret_cast<const uint8_t *>(obj.get_data_addr()));
+        
+    // 2. Finalize the pointer with the new replica array
+    // (This calls the gc_wb function we rewrote earlier)
+    meta().gc_wb(obj.get_ds_id(), obj.size(), new_replicas);
+
     if (!meta_snapshot.is_shared()) {
       meta().clear_dirty();
     } else {
@@ -166,8 +177,9 @@ retry:
     goto retry;
   }
 
-  meta() = other.meta();
+  meta() = std::move(other.meta());
   wmb();
+
   if (other_present) {
     if (meta().is_shared()) {
       auto *other_ptr = reinterpret_cast<GenericSharedPtr *>(&other);
@@ -180,8 +192,11 @@ retry:
     }
     other_object.set_ptr_addr(reinterpret_cast<uint64_t>(this));
   }
-  __builtin_memcpy(reinterpret_cast<uint64_t *>(&other.meta()), &reset_value,
-                   sizeof(reset_value));
+
+  other.meta().from_uint64_t(reset_value);
+  other.meta().clear_replicas();
+  //__builtin_memcpy(reinterpret_cast<uint64_t *>(&other.meta()), &reset_value,
+  //                 sizeof(reset_value));
 }
 
 void GenericUniquePtr::_free() {
@@ -223,9 +238,6 @@ restart:
       goto restart;
     }
     _flush(/* obj_locked = */ true);
-    auto ds_id = obj.get_ds_id();
-    auto obj_size = obj.size();
-    meta().gc_wb(ds_id, obj_size, *reinterpret_cast<const uint64_t *>(obj_id));
     obj.free();
   }
 }

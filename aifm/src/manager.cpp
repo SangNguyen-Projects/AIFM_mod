@@ -49,9 +49,9 @@ void GCParallelizer::master_fn() {
 }
 
 FarMemManager::FarMemManager(uint64_t cache_size, uint64_t far_mem_size,
-                             uint32_t num_gc_threads, FarMemDevice *device)
+                             uint32_t num_gc_threads, std::vector<FarMemDevice*> devices)
     : cache_region_manager_(cache_size, true),
-      far_mem_region_manager_(far_mem_size, false), device_ptr_(device),
+      far_mem_region_manager_(far_mem_size, false),
       parallel_marker_(num_gc_threads, kGCSlaveThreadTaskQueueDepth,
                        &from_regions_),
       parallel_write_backer_(num_gc_threads, kGCSlaveThreadTaskQueueDepth,
@@ -59,6 +59,10 @@ FarMemManager::FarMemManager(uint64_t cache_size, uint64_t far_mem_size,
       num_gc_threads_(num_gc_threads) {
 
   BUG_ON(far_mem_size >= (1ULL << FarMemPtrMeta::kObjectIDBitSize));
+  
+  for (auto* d : devices) {
+    devices_.emplace_back(d);
+  }
 
   ksched_fd_ = open("/dev/ksched", O_RDWR);
   if (ksched_fd_ < 0) {
@@ -204,7 +208,7 @@ bool FarMemManager::RegionManager::try_refill_core_local_free_region(
 FarMemManager *
 FarMemManagerFactory::build(uint64_t cache_size,
                             std::optional<uint32_t> optional_num_gc_threads,
-                            FarMemDevice *device) {
+                            std::vector<FarMemDevice*> devices) {
   if (unlikely(ptr_)) {
     return nullptr;
   }
@@ -214,9 +218,55 @@ FarMemManagerFactory::build(uint64_t cache_size,
   if (unlikely(!num_gc_threads)) {
     return nullptr;
   }
-  ptr_ = new FarMemManager(cache_size, device->get_far_mem_size(),
-                           num_gc_threads, device);
+
+  uint64_t far_mem_size = 0;
+
+  for (auto* d : devices) {
+    far_mem_size += d->get_far_mem_size();
+  }
+
+  ptr_ = new FarMemManager(cache_size, far_mem_size,
+                           num_gc_threads, devices);
   return ptr_;
+}
+
+std::vector<FarMemPtrMeta::ReplicaLocation> FarMemManager::write_object_quorum(
+    uint8_t ds_id, uint8_t obj_id_len, const uint8_t *obj_id,
+    uint16_t data_len, const uint8_t *data_buf) {
+    
+    constexpr int N = 2; // Your prototype replication factor
+    std::vector<FarMemPtrMeta::ReplicaLocation> new_replicas;
+    std::vector<uint16_t> selected_nodes;
+    
+    // 1. Round-Robin Selection
+    for (int i = 0; i < N; i++) {
+        // fetch_add ensures thread-safe round-robin across multiple GC threads
+        uint16_t node_idx = next_node_idx_.fetch_add(1) % devices_.size();
+        selected_nodes.push_back(node_idx);
+        
+        // Pack the physical location (using obj_id as the remote address identifier)
+        new_replicas.push_back({node_idx, *reinterpret_cast<const uint64_t*>(obj_id)});
+    }
+
+    // 2. Concurrent Writes using Shenango Waitgroups
+    waitgroup_t wg;
+    waitgroup_init(&wg);
+    waitgroup_add(&wg, N);
+
+    for (uint16_t node_idx : selected_nodes) {
+        // Spawn a lightweight Shenango thread for each network stream
+        thread_spawn([this, node_idx, ds_id, obj_id_len, obj_id, data_len, data_buf, &wg]() {
+            this->devices_[node_idx]->write_object(
+                ds_id, obj_id_len, obj_id, data_len, data_buf);
+            waitgroup_done(&wg);
+        });
+    }
+
+    // 3. The Quorum Wait
+    // This suspends the current GC thread until both nodes ACK the write
+    waitgroup_wait(&wg);
+
+    return new_replicas;
 }
 
 FarMemManager::RegionManager::RegionManager(uint64_t size, bool is_local) {
@@ -273,14 +323,86 @@ void FarMemManager::swap_in(bool nt, GenericFarMemPtr *ptr) {
     auto obj_addr = allocate_local_object(nt, meta.get_object_size());
     auto obj = Object(obj_addr);
     auto ds_id = meta.get_ds_id();
-    uint16_t obj_data_len;
     auto obj_data_addr = reinterpret_cast<uint8_t *>(obj.get_data_addr());
-    device_ptr_->read_object(ds_id, sizeof(obj_id),
-                             reinterpret_cast<uint8_t *>(&obj_id),
-                             &obj_data_len, obj_data_addr);
+
+    // ========================================================================
+    // [NEW] HEDGED READ LOGIC
+    // ========================================================================
+    auto replicas = meta.get_replicas();
+    
+    // Fallback if an object somehow bypassed quorum writes
+    if (replicas.empty()) {
+        uint16_t dummy_len;
+        devices_[0]->read_object(ds_id, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id), &dummy_len, obj_data_addr);
+        obj.init(ds_id, dummy_len, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id));
+    } else {
+        std::atomic<bool> read_finished{false};
+        waitgroup_t wg;
+        waitgroup_init(&wg);
+        waitgroup_add(&wg, 1); // We only wait for the FIRST successful read
+
+        uint16_t primary_node = replicas[0].node_id;
+        uint64_t primary_remote_id = replicas[0].object_id;
+        uint16_t final_data_len = 0; // Populated by the winner
+
+        // 1. Fire Primary Request
+        thread_spawn([&, primary_node, primary_remote_id]() {
+            uint16_t local_len;
+            // Read directly into the final memory location
+            this->devices_[primary_node]->read_object(
+                ds_id, sizeof(primary_remote_id),
+                reinterpret_cast<const uint8_t *>(&primary_remote_id),
+                &local_len, obj_data_addr);
+
+            bool expected = false;
+            if (read_finished.compare_exchange_strong(expected, true)) {
+                final_data_len = local_len;
+                waitgroup_done(&wg); // We won! Wake up the application.
+            }
+        });
+
+        // 2. The Micro-Timer & Secondary Request
+        if (replicas.size() > 1) {
+            uint16_t secondary_node = replicas[1].node_id;
+            uint64_t secondary_remote_id = replicas[1].object_id;
+
+            thread_spawn([&, secondary_node, secondary_remote_id]() {
+                // The Micro-Timer (e.g., 5000 microseconds = 5ms)
+                timer_sleep(5000);
+
+                // If primary already finished, silently exit without using network
+                if (read_finished.load()) return;
+
+                // Allocate a temporary buffer to prevent a C++ memory race on obj_data_addr
+                uint8_t temp_buf[Object::kMaxObjectDataSize];
+                uint16_t local_len;
+
+                this->devices_[secondary_node]->read_object(
+                    ds_id, sizeof(secondary_remote_id),
+                    reinterpret_cast<const uint8_t *>(&secondary_remote_id),
+                    &local_len, temp_buf);
+
+                bool expected = false;
+                // If we beat the delayed primary node, copy our temp buffer to RAM
+                if (read_finished.compare_exchange_strong(expected, true)) {
+                    memcpy(obj_data_addr, temp_buf, local_len);
+                    final_data_len = local_len;
+                    waitgroup_done(&wg);
+                }
+            });
+        }
+
+        // 3. Block the mutator thread until ONE of the reads finishes
+        waitgroup_wait(&wg);
+
+        // Initialize the object with the winner's data length
+        obj.init(ds_id, final_data_len, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id));
+    }
+    // ========================================================================
+    // END HEDGED READ LOGIC
+    // ========================================================================
     wmb();
-    obj.init(ds_id, obj_data_len, sizeof(obj_id),
-             reinterpret_cast<uint8_t *>(&obj_id));
+
     if (!meta.is_shared()) {
       meta.set_present(obj_addr);
     } else {
@@ -351,6 +473,7 @@ void FarMemManager::swap_out(GenericFarMemPtr *ptr, Object obj) {
   auto ds_id = obj.get_ds_id();
   auto data_ptr = reinterpret_cast<const uint8_t *>(obj.get_data_addr());
 
+  /*
   auto write_object_fn = [&](uint32_t data_len) {
     if (dirty) {
       device_ptr_->write_object(ds_id, obj_id_len, obj_id, data_len, data_ptr);
@@ -372,6 +495,37 @@ void FarMemManager::swap_out(GenericFarMemPtr *ptr, Object obj) {
         [=](GenericFarMemPtr *ptr) {
           ptr->meta().gc_wb(ds_id, obj_size,
                             *reinterpret_cast<const uint64_t *>(obj_id));
+        });
+  }
+  */
+
+  std::vector<FarMemPtrMeta::ReplicaLocation> new_replicas;
+
+  auto write_object_fn = [&](uint32_t data_len) {
+    if (dirty) {
+      // Fire the simultaneous quorum write
+      new_replicas = write_object_quorum(ds_id, obj_id_len, obj_id, data_len, data_ptr);
+    } else {
+      // If the object isn't dirty, it's already in far memory. Keep existing replicas.
+      new_replicas = meta.get_replicas();
+    }
+  };
+
+  if (auto evac_notifier = evac_notifiers_[ds_id]) {
+    if (evac_notifier(obj, write_object_fn)) { // Ptr removed.
+      return;
+    }
+  } else {
+    write_object_fn(obj.get_data_len());
+  }
+
+  // Finalize using the new gc_wb signature from pointer.cpp
+  if (!meta.is_shared()) {
+    meta.gc_wb(ds_id, obj_size, new_replicas);
+  } else {
+    reinterpret_cast<GenericSharedPtr *>(ptr)->traverse(
+        [=, &new_replicas](GenericFarMemPtr *p) {
+          p->meta().gc_wb(ds_id, obj_size, new_replicas);
         });
   }
 }

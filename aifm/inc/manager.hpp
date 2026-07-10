@@ -92,7 +92,10 @@ private:
   RegionManager far_mem_region_manager_;
   std::atomic<uint32_t> pending_gcs_{0};
   bool gc_master_spawned_;
-  std::unique_ptr<FarMemDevice> device_ptr_;
+  //std::unique_ptr<FarMemDevice> device_ptr_;
+  std::vector<std::unique_ptr<FarMemDevice>> devices_;
+  std::atomic<uint16_t> next_node_idx_{0};
+
   rt::CondVar mutator_cache_condvar_;
   rt::CondVar mutator_far_mem_condvar_;
   rt::Spin gc_lock_;
@@ -114,8 +117,10 @@ private:
   friend class GenericConcurrentHopscotch;
   template <typename T> friend class DataFrameVector;
 
+  //FarMemManager(uint64_t cache_size, uint64_t far_mem_size,
+  //              uint32_t num_gc_threads, FarMemDevice *device);
   FarMemManager(uint64_t cache_size, uint64_t far_mem_size,
-                uint32_t num_gc_threads, FarMemDevice *device);
+                uint32_t num_gc_threads, std::vector<FarMemDevice*> devices);
   bool is_free_cache_almost_empty() const;
   bool is_free_cache_low() const;
   bool is_free_cache_high() const;
@@ -217,9 +222,14 @@ private:
   friend class FarMemManager;
 
 public:
+  //static FarMemManager *build(uint64_t cache_size,
+  //                            std::optional<uint32_t> optional_num_gc_threads,
+  //                            FarMemDevice *device);
+
   static FarMemManager *build(uint64_t cache_size,
                               std::optional<uint32_t> optional_num_gc_threads,
-                              FarMemDevice *device);
+                              std::vector<FarMemDevice*> devices);
+
   static FarMemManager *get();
 };
 

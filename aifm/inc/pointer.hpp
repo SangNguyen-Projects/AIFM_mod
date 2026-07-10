@@ -43,6 +43,14 @@ private:
   constexpr static uint32_t kSharedBitPos = 9;
 
   uint8_t metadata_[kSize];
+
+  struct ReplicaLocation {
+    uint16_t node_id;
+    uint64_t object_id;
+  };
+
+  std::vector<ReplicaLocation> replicas_;
+
   friend class FarMemManager;
   friend class GenericFarMemPtr;
 
@@ -54,8 +62,16 @@ public:
   constexpr static uint64_t kNullMask =
       ((~static_cast<uint64_t>(0)) << (8 * kPresentPos));
 
-  FarMemPtrMeta(const FarMemPtrMeta &other);
+  FarMemPtrMeta(FarMemPtrMeta&& other) noexcept = default;
+  FarMemPtrMeta& operator=(FarMemPtrMeta&& other) noexcept = default;
+  
+  // If a copy is absolutely required by GenericSharedPtr, ensure deep copy of vector
+  FarMemPtrMeta(const FarMemPtrMeta &other) = default; 
+  FarMemPtrMeta& operator=(const FarMemPtrMeta &other) = default;
+
+  //FarMemPtrMeta(const FarMemPtrMeta &other);
   FarMemPtrMeta(bool shared, uint64_t object_addr);
+
   bool operator==(const FarMemPtrMeta &other) const;
   bool operator!=(const FarMemPtrMeta &other) const;
   bool is_dirty() const;
@@ -71,6 +87,19 @@ public:
   bool is_evacuation() const;
   bool is_shared() const;
   void set_shared();
+
+  void add_replica(uint16_t node_id, uint64_t obj_id) {
+      replicas_.push_back({node_id, obj_id});
+  }
+  
+  const std::vector<ReplicaLocation>& get_replicas() const {
+      return replicas_;
+  }
+  
+  void clear_replicas() {
+      replicas_.clear();
+  }
+
   uint64_t get_object_id() const;
   uint64_t get_object_data_addr() const;
   void set_object_data_addr(uint64_t new_local_object_addr);
@@ -84,7 +113,7 @@ public:
   void from_uint64_t(uint64_t val);
   void mutator_copy(uint64_t new_local_object_addr);
   void gc_copy(uint64_t new_local_object_addr);
-  void gc_wb(uint8_t ds_id, uint16_t object_size, uint64_t obj_id);
+  void gc_wb(uint8_t ds_id, uint16_t object_size, const std::vector<ReplicaLocation>& new_replicas);
   static FarMemPtrMeta *from_object(const Object &object);
 };
 
