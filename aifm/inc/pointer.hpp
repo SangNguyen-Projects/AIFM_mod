@@ -2,6 +2,7 @@
 
 #include "deref_scope.hpp"
 #include "object.hpp"
+#include <vector>
 
 namespace far_memory {
 

@@ -14,12 +14,14 @@ FORCE_INLINE FarMemPtrMeta::FarMemPtrMeta() {
   nullify();
 }
 
+/*
 FORCE_INLINE FarMemPtrMeta::FarMemPtrMeta(const FarMemPtrMeta &other) {
   assert(reinterpret_cast<uint64_t>(this) % sizeof(FarMemPtrMeta) == 0);
   static_assert(kSize == sizeof(uint64_t));
   *reinterpret_cast<uint64_t *>(metadata_) =
       *reinterpret_cast<const uint64_t *>(other.metadata_);
 }
+*/
 
 FORCE_INLINE
 FarMemPtrMeta::FarMemPtrMeta(bool shared, uint64_t object_addr) {
