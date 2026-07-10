@@ -51,6 +51,9 @@ void FarMemPtrMeta::gc_wb(uint8_t ds_id, uint16_t object_size, uint64_t obj_id) 
 
 void FarMemPtrMeta::gc_wb(uint8_t ds_id, uint16_t object_size,
                           const std::vector<ReplicaLocation>& new_replicas) {
+  
+  uint64_t obj_id = new_replicas.empty() ? 0 : new_replicas[0].object_id;
+                          
   auto new_metadata =
       (obj_id << kObjectIDBitPos) |
       (static_cast<uint64_t>(object_size) << kObjectSizeBitPos) |
