@@ -255,7 +255,7 @@ std::vector<FarMemPtrMeta::ReplicaLocation> FarMemManager::write_object_quorum(
 
     for (uint16_t node_idx : selected_nodes) {
         // Spawn a lightweight Shenango thread for each network stream
-        thread_spawn([this, node_idx, ds_id, obj_id_len, obj_id, data_len, data_buf, &wg]() {
+        rt::Spawn([this, node_idx, ds_id, obj_id_len, obj_id, data_len, data_buf, &wg]() {
             this->devices_[node_idx]->write_object(
                 ds_id, obj_id_len, obj_id, data_len, data_buf);
             waitgroup_done(&wg);
@@ -346,7 +346,7 @@ void FarMemManager::swap_in(bool nt, GenericFarMemPtr *ptr) {
         uint16_t final_data_len = 0; // Populated by the winner
 
         // 1. Fire Primary Request
-        thread_spawn([&, primary_node, primary_remote_id]() {
+        rt::Spawn([&, primary_node, primary_remote_id]() {
             uint16_t local_len;
             // Read directly into the final memory location
             this->devices_[primary_node]->read_object(
@@ -366,7 +366,7 @@ void FarMemManager::swap_in(bool nt, GenericFarMemPtr *ptr) {
             uint16_t secondary_node = replicas[1].node_id;
             uint64_t secondary_remote_id = replicas[1].object_id;
 
-            thread_spawn([&, secondary_node, secondary_remote_id]() {
+            rt::Spawn([&, secondary_node, secondary_remote_id]() {
                 // The Micro-Timer (e.g., 5000 microseconds = 5ms)
                 timer_sleep(5000);
 

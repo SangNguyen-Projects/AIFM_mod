@@ -43,6 +43,12 @@ void FarMemPtrMeta::gc_copy(uint64_t new_local_object_addr) {
   from_uint64_t(new_metadata);
 }
 
+void FarMemPtrMeta::gc_wb(uint8_t ds_id, uint16_t object_size, uint64_t obj_id) {
+  std::vector<ReplicaLocation> temp_replicas;
+  temp_replicas.push_back({0, obj_id});
+  gc_wb(ds_id, object_size, temp_replicas);
+}
+
 void FarMemPtrMeta::gc_wb(uint8_t ds_id, uint16_t object_size,
                           const std::vector<ReplicaLocation>& new_replicas) {
   auto new_metadata =

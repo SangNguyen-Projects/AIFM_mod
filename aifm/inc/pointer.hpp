@@ -27,7 +27,7 @@ public:
     uint16_t node_id;
     uint64_t object_id;
   };
-  
+
 private:
   constexpr static uint32_t kSize = 8;
   constexpr static uint32_t kEvacuationPos = 2;
@@ -114,6 +114,7 @@ public:
   void from_uint64_t(uint64_t val);
   void mutator_copy(uint64_t new_local_object_addr);
   void gc_copy(uint64_t new_local_object_addr);
+  void gc_wb(uint8_t ds_id, uint16_t object_size, uint64_t obj_id);
   void gc_wb(uint8_t ds_id, uint16_t object_size, const std::vector<ReplicaLocation>& new_replicas);
   static FarMemPtrMeta *from_object(const Object &object);
 };

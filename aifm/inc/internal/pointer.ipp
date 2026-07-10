@@ -24,7 +24,8 @@ FORCE_INLINE FarMemPtrMeta::FarMemPtrMeta(const FarMemPtrMeta &other) {
 FORCE_INLINE
 FarMemPtrMeta::FarMemPtrMeta(bool shared, uint64_t object_addr) {
   assert(reinterpret_cast<uint64_t>(this) % sizeof(FarMemPtrMeta) == 0);
-  memset(this, 0, sizeof(*this));
+  //memset(this, 0, sizeof(*this));
+  memset(metadata_, 0, kSize);
   init(shared, object_addr);
 }
 
