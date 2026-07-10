@@ -156,7 +156,7 @@ public:
   CopyNotifier copy_notifiers_[kMaxNumDSIDs];
 
   ~FarMemManager();
-  FarMemDevice *get_device() const { return device_ptr_.get(); }
+  FarMemDevice *get_device() const { return devices_[0].get(); }
   double get_free_mem_ratio() const;
   bool allocate_generic_unique_ptr_nb(
       GenericUniquePtr *ptr, uint8_t ds_id, uint16_t item_size,
@@ -212,6 +212,10 @@ public:
   void mutator_wait_for_gc_cache();
   static void lock_object(uint8_t obj_id_len, const uint8_t *obj_id);
   static void unlock_object(uint8_t obj_id_len, const uint8_t *obj_id);
+
+  std::vector<FarMemPtrMeta::ReplicaLocation> write_object_quorum(
+    uint8_t ds_id, uint8_t obj_id_len, const uint8_t *obj_id,
+    uint16_t data_len, const uint8_t *data_buf);
 };
 
 class FarMemManagerFactory {

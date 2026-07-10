@@ -22,6 +22,12 @@ namespace far_memory {
 //          Object ID: universal object ID (used when swapping in).
 
 class FarMemPtrMeta {
+public:
+  struct ReplicaLocation {
+    uint16_t node_id;
+    uint64_t object_id;
+  };
+  
 private:
   constexpr static uint32_t kSize = 8;
   constexpr static uint32_t kEvacuationPos = 2;
@@ -43,11 +49,6 @@ private:
   constexpr static uint32_t kSharedBitPos = 9;
 
   uint8_t metadata_[kSize];
-
-  struct ReplicaLocation {
-    uint16_t node_id;
-    uint64_t object_id;
-  };
 
   std::vector<ReplicaLocation> replicas_;
 

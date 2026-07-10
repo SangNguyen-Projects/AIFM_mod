@@ -131,24 +131,36 @@ FORCE_INLINE void FarMemManager::read_object(uint8_t ds_id, uint8_t obj_id_len,
                                              const uint8_t *obj_id,
                                              uint16_t *data_len,
                                              uint8_t *data_buf) {
-  device_ptr_->read_object(ds_id, obj_id_len, obj_id, data_len, data_buf);
+  // Phase 1: Read from the primary node. (Hedged reads take over elsewhere)
+  devices_[0]->read_object(ds_id, obj_id_len, obj_id, data_len, data_buf);
 }
 
 FORCE_INLINE bool FarMemManager::remove_object(uint64_t ds_id,
                                                uint8_t obj_id_len,
                                                const uint8_t *obj_id) {
-  return device_ptr_->remove_object(ds_id, obj_id_len, obj_id);
+  // Broadcast the delete command to the entire cluster
+  bool success = true;
+  for (auto& device : devices_) {
+      success &= device->remove_object(ds_id, obj_id_len, obj_id);
+  }
+  return success;
 }
 
 FORCE_INLINE void FarMemManager::construct(uint8_t ds_type, uint8_t ds_id,
                                            uint32_t param_len,
                                            uint8_t *params) {
-  device_ptr_->construct(ds_type, ds_id, param_len, params);
+  // Broadcast data structure construction to the entire cluster
+  for (auto& device : devices_) {
+      device->construct(ds_type, ds_id, param_len, params);
+  }
 }
 
 FORCE_INLINE void FarMemManager::destruct(uint8_t ds_id) {
   free_ds_id(ds_id);
-  device_ptr_->destruct(ds_id);
+  // Broadcast data structure destruction to the entire cluster
+  for (auto& device : devices_) {
+      device->destruct(ds_id);
+  }
 }
 
 FORCE_INLINE uint64_t get_obj_id_fragment(uint8_t obj_id_len,
