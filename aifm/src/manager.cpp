@@ -68,7 +68,7 @@ FarMemManager::FarMemManager(uint64_t cache_size, uint64_t far_mem_size,
   if (ksched_fd_ < 0) {
     LOG_PRINTF("%s\n", "Warn: fail to open /dev/ksched.");
   }
-  memset(evac_notifiers_, 0, sizeof(evac_notifiers_));
+  //memset(evac_notifiers_, 0, sizeof(evac_notifiers_));
 
   for (uint8_t ds_id =
            std::numeric_limits<decltype(available_ds_ids_)::value_type>::min();
@@ -336,67 +336,97 @@ void FarMemManager::swap_in(bool nt, GenericFarMemPtr *ptr) {
         devices_[0]->read_object(ds_id, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id), &dummy_len, obj_data_addr);
         obj.init(ds_id, dummy_len, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id));
     } else {
-        std::atomic<bool> read_finished{false};
-        waitgroup_t wg;
-        waitgroup_init(&wg);
-        waitgroup_add(&wg, 1); // We only wait for the FIRST successful read
+        // 1. Precise, Leak-Proof Memory State
+        struct HedgedState {
+            std::atomic<bool> finished{false};
+            std::atomic<int> ref_count{0}; // Custom garbage collection
+            waitgroup_t wg;
+            uint16_t final_data_len{0};
+            uint8_t* winner_buf_ptr{nullptr}; 
+            
+            // Safe, exact-sized buffers
+            std::vector<uint8_t> primary_buf;
+            std::vector<uint8_t> secondary_buf;
+            
+            HedgedState(size_t buf_size, int refs) : ref_count(refs) { 
+                primary_buf.resize(buf_size);
+                secondary_buf.resize(buf_size);
+                waitgroup_init(&wg); 
+            }
+        };
+
+        // Determine participants (Main Thread + Background Threads)
+        int num_bg_threads = (replicas.size() > 1) ? 2 : 1;
+        
+        // Exact size allocation (Prevents the 40GB explosion)
+        // ref_count starts at total participants (threads + main thread)
+        auto state = new HedgedState(meta.get_object_size(), num_bg_threads + 1);
+        waitgroup_add(&state->wg, 1);
 
         uint16_t primary_node = replicas[0].node_id;
         uint64_t primary_remote_id = replicas[0].object_id;
-        uint16_t final_data_len = 0; // Populated by the winner
 
-        // 1. Fire Primary Request
-        rt::Spawn([&, primary_node, primary_remote_id]() {
+        // 2. Thread 1: Primary Request
+        rt::Spawn([this, primary_node, primary_remote_id, ds_id, state]() {
             uint16_t local_len;
-            // Read directly into the final memory location
             this->devices_[primary_node]->read_object(
                 ds_id, sizeof(primary_remote_id),
                 reinterpret_cast<const uint8_t *>(&primary_remote_id),
-                &local_len, obj_data_addr);
+                &local_len, state->primary_buf.data()); 
 
             bool expected = false;
-            if (read_finished.compare_exchange_strong(expected, true)) {
-                final_data_len = local_len;
-                waitgroup_done(&wg); // We won! Wake up the application.
+            if (state->finished.compare_exchange_strong(expected, true)) {
+                state->final_data_len = local_len;
+                state->winner_buf_ptr = state->primary_buf.data();
+                waitgroup_done(&state->wg);
+            }
+            
+            // Custom GC: If I am the last entity touching this state, delete it
+            if (state->ref_count.fetch_sub(1) == 1) {
+                delete state;
             }
         });
-
-        // 2. The Micro-Timer & Secondary Request
-        if (replicas.size() > 1) {
+        
+        // 3. Thread 2: Secondary Request
+        if (num_bg_threads > 1) {
             uint16_t secondary_node = replicas[1].node_id;
             uint64_t secondary_remote_id = replicas[1].object_id;
 
-            rt::Spawn([&, secondary_node, secondary_remote_id]() {
-                // The Micro-Timer (e.g., 5000 microseconds = 5ms)
-                timer_sleep(5000);
+            rt::Spawn([this, secondary_node, secondary_remote_id, ds_id, state]() {
+                timer_sleep(5000); 
+                if (!state->finished.load()) {
+                    uint16_t local_len;
+                    this->devices_[secondary_node]->read_object(
+                        ds_id, sizeof(secondary_remote_id),
+                        reinterpret_cast<const uint8_t *>(&secondary_remote_id),
+                        &local_len, state->secondary_buf.data());
 
-                // If primary already finished, silently exit without using network
-                if (read_finished.load()) return;
-
-                // Allocate a temporary buffer to prevent a C++ memory race on obj_data_addr
-                uint8_t temp_buf[Object::kMaxObjectDataSize];
-                uint16_t local_len;
-
-                this->devices_[secondary_node]->read_object(
-                    ds_id, sizeof(secondary_remote_id),
-                    reinterpret_cast<const uint8_t *>(&secondary_remote_id),
-                    &local_len, temp_buf);
-
-                bool expected = false;
-                // If we beat the delayed primary node, copy our temp buffer to RAM
-                if (read_finished.compare_exchange_strong(expected, true)) {
-                    memcpy(obj_data_addr, temp_buf, local_len);
-                    final_data_len = local_len;
-                    waitgroup_done(&wg);
+                    bool expected = false;
+                    if (state->finished.compare_exchange_strong(expected, true)) {
+                        state->final_data_len = local_len;
+                        state->winner_buf_ptr = state->secondary_buf.data();
+                        waitgroup_done(&state->wg);
+                    }
+                }
+                
+                // Custom GC: If I am the last entity touching this state, delete it
+                if (state->ref_count.fetch_sub(1) == 1) {
+                    delete state;
                 }
             });
         }
+       
+        // 4. Block mutator until the first read finishes
+        waitgroup_wait(&state->wg);
 
-        // 3. Block the mutator thread until ONE of the reads finishes
-        waitgroup_wait(&wg);
-
-        // Initialize the object with the winner's data length
-        obj.init(ds_id, final_data_len, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id));
+        // 5. Safely copy the winning buffer to the live application memory
+        memcpy(obj_data_addr, state->winner_buf_ptr, state->final_data_len);
+        obj.init(ds_id, state->final_data_len, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id));
+        
+        // 6. Main thread is done. Decrement count, delete if it's the last one alive
+        if (state->ref_count.fetch_sub(1) == 1) {
+            delete state;
+        }
     }
     // ========================================================================
     // END HEDGED READ LOGIC

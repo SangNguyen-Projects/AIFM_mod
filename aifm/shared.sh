@@ -3,6 +3,7 @@
 AIFM_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 SHENANGO_PATH=$AIFM_PATH/../shenango
 
+SHENANGO_IPS=("18.18.1.3" "18.18.1.4" "18.18.1.5")
 MEM_SERVER_PORT=8000
 MEM_SERVER_STACK_KB=65536
 
@@ -52,6 +53,29 @@ function kill_local_iokerneld {
     kill_process iokerneld
 }
 
+function run_local_iokerneld {
+    kill_local_iokerneld
+    sudo $SHENANGO_PATH/iokerneld $@ > /dev/null 2>&1 &
+    disown -r
+    assert_success
+    sleep 3
+}
+
+function rerun_local_iokerneld {
+    kill_local_iokerneld
+    run_local_iokerneld simple
+}
+
+function rerun_local_iokerneld_noht {
+    kill_local_iokerneld
+    run_local_iokerneld simple noht
+}
+
+function rerun_local_iokerneld_args {
+    kill_local_iokerneld
+    run_local_iokerneld $@
+}
+
 # Note: Added index parameter to kill_mem_server to allow targeted kills
 function kill_mem_server {
     for i in "${!NODE_IPS[@]}"; do
@@ -78,8 +102,7 @@ function rerun_mem_server {
 # Client side: Generate the comma-separated IP string for your C++ test
 function get_cluster_conn_str {
     local conn_str=""
-    for node in "${NODE_IPS[@]}"; do
-        local ip=${node%:*}
+    for ip in "${SHENANGO_IPS[@]}"; do
         conn_str+="$ip:$MEM_SERVER_PORT,"
     done
     echo ${conn_str%,}
