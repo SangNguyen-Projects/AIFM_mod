@@ -51,8 +51,6 @@ private:
 
   uint8_t metadata_[kSize];
 
-  std::vector<ReplicaLocation> replicas_;
-
   friend class FarMemManager;
   friend class GenericFarMemPtr;
 
@@ -89,18 +87,6 @@ public:
   bool is_evacuation() const;
   bool is_shared() const;
   void set_shared();
-
-  void add_replica(uint16_t node_id, uint64_t obj_id) {
-      replicas_.push_back({node_id, obj_id});
-  }
-  
-  const std::vector<ReplicaLocation>& get_replicas() const {
-      return replicas_;
-  }
-  
-  void clear_replicas() {
-      replicas_.clear();
-  }
 
   uint64_t get_object_id() const;
   uint64_t get_object_data_addr() const;

@@ -230,43 +230,51 @@ FarMemManagerFactory::build(uint64_t cache_size,
   return ptr_;
 }
 
-std::vector<FarMemPtrMeta::ReplicaLocation> FarMemManager::write_object_quorum(
+void FarMemManager::write_object_quorum(
     uint8_t ds_id, uint8_t obj_id_len, const uint8_t *obj_id,
     uint16_t data_len, const uint8_t *data_buf) {
     
-    constexpr int N = 2; // Your prototype replication factor
-    std::vector<FarMemPtrMeta::ReplicaLocation> new_replicas;
-    std::vector<uint16_t> selected_nodes;
+    // Set replication factor 
+    // Using std::min prevents setting N higher than the physical nodes you have.
+    int N = std::min(static_cast<int>(devices_.size()), 2); 
     
-    // 1. Round-Robin Selection
-    for (int i = 0; i < N; i++) {
-        // fetch_add ensures thread-safe round-robin across multiple GC threads
-        uint16_t node_idx = next_node_idx_.fetch_add(1) % devices_.size();
-        selected_nodes.push_back(node_idx);
-        
-        // Pack the physical location (using obj_id as the remote address identifier)
-        new_replicas.push_back({node_idx, *reinterpret_cast<const uint64_t*>(obj_id)});
-    }
+    uint64_t remote_id = 0;
+    memcpy(&remote_id, obj_id, std::min((size_t)obj_id_len, sizeof(uint64_t)));
+    
+    uint16_t primary_node = remote_id % devices_.size();
 
-    // 2. Concurrent Writes using Shenango Waitgroups
+    std::vector<uint16_t> target_nodes(N);
+
     waitgroup_t wg;
     waitgroup_init(&wg);
-    waitgroup_add(&wg, N);
+    
+    // Only wait for N - 1 threads, because the main thread handles the first write
+    if (N > 1) {
+        waitgroup_add(&wg, N - 1);
+    }
 
-    for (uint16_t node_idx : selected_nodes) {
-        // Spawn a lightweight Shenango thread for each network stream
+    // 1. Spawn background threads for replicas 1 through N-1
+    for (int i = 1; i < N; i++) {
+        target_nodes[i] = (primary_node + i) % devices_.size();
+        uint16_t node_idx = target_nodes[i];
+        
+        
         rt::Spawn([this, node_idx, ds_id, obj_id_len, obj_id, data_len, data_buf, &wg]() {
-            this->devices_[node_idx]->write_object(
-                ds_id, obj_id_len, obj_id, data_len, data_buf);
-            waitgroup_done(&wg);
+                this->devices_[node_idx]->write_object(
+                    ds_id, obj_id_len, obj_id, data_len, data_buf);
+                waitgroup_done(&wg);
         });
     }
 
-    // 3. The Quorum Wait
-    // This suspends the current GC thread until both nodes ACK the write
-    waitgroup_wait(&wg);
+    // 2. Main thread: Write to primary node (index 0) synchronously
+    target_nodes[0] = primary_node;
+    this->devices_[target_nodes[0]]->write_object(
+            ds_id, obj_id_len, obj_id, data_len, data_buf);
 
-    return new_replicas;
+    // 3. Block until all background threads finish
+    if (N > 1) {
+        waitgroup_wait(&wg);
+    }
 }
 
 FarMemManager::RegionManager::RegionManager(uint64_t size, bool is_local) {
@@ -326,111 +334,31 @@ void FarMemManager::swap_in(bool nt, GenericFarMemPtr *ptr) {
     auto obj_data_addr = reinterpret_cast<uint8_t *>(obj.get_data_addr());
 
     // ========================================================================
-    // [NEW] HEDGED READ LOGIC
+    // READ LOGIC
     // ========================================================================
-    auto replicas = meta.get_replicas();
-    
-    // Fallback if an object somehow bypassed quorum writes
-    if (replicas.empty()) {
-        uint16_t dummy_len;
-        devices_[0]->read_object(ds_id, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id), &dummy_len, obj_data_addr);
-        obj.init(ds_id, dummy_len, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id));
-    } else {
-        // 1. Precise, Leak-Proof Memory State
-        struct HedgedState {
-            std::atomic<bool> finished{false};
-            std::atomic<int> ref_count{0}; // Custom garbage collection
-            waitgroup_t wg;
-            uint16_t final_data_len{0};
-            uint8_t* winner_buf_ptr{nullptr}; 
-            
-            // Safe, exact-sized buffers
-            std::vector<uint8_t> primary_buf;
-            std::vector<uint8_t> secondary_buf;
-            
-            HedgedState(size_t buf_size, int refs) : ref_count(refs) { 
-                primary_buf.resize(buf_size);
-                secondary_buf.resize(buf_size);
-                waitgroup_init(&wg); 
-            }
-        };
+    uint64_t remote_id = 0;
+    memcpy(&remote_id, &obj_id, std::min(sizeof(obj_id), sizeof(uint64_t)));
+    uint16_t primary_node = remote_id % devices_.size();
 
-        // Determine participants (Main Thread + Background Threads)
-        int num_bg_threads = (replicas.size() > 1) ? 2 : 1;
-        
-        // Exact size allocation (Prevents the 40GB explosion)
-        // ref_count starts at total participants (threads + main thread)
-        auto state = new HedgedState(meta.get_object_size(), num_bg_threads + 1);
-        waitgroup_add(&state->wg, 1);
+    uint16_t local_len = 0;
+    this->devices_[primary_node]->read_object(
+        ds_id, sizeof(remote_id),
+        reinterpret_cast<const uint8_t *>(&remote_id),
+        &local_len, obj_data_addr); 
 
-        uint16_t primary_node = replicas[0].node_id;
-        uint64_t primary_remote_id = replicas[0].object_id;
-
-        // 2. Thread 1: Primary Request
-        rt::Spawn([this, primary_node, primary_remote_id, ds_id, state]() {
-            uint16_t local_len;
-            this->devices_[primary_node]->read_object(
-                ds_id, sizeof(primary_remote_id),
-                reinterpret_cast<const uint8_t *>(&primary_remote_id),
-                &local_len, state->primary_buf.data()); 
-
-            bool expected = false;
-            if (state->finished.compare_exchange_strong(expected, true)) {
-                state->final_data_len = local_len;
-                state->winner_buf_ptr = state->primary_buf.data();
-                waitgroup_done(&state->wg);
-            }
-            
-            // Custom GC: If I am the last entity touching this state, delete it
-            if (state->ref_count.fetch_sub(1) == 1) {
-                delete state;
-            }
-        });
-        
-        // 3. Thread 2: Secondary Request
-        if (num_bg_threads > 1) {
-            uint16_t secondary_node = replicas[1].node_id;
-            uint64_t secondary_remote_id = replicas[1].object_id;
-
-            rt::Spawn([this, secondary_node, secondary_remote_id, ds_id, state]() {
-                timer_sleep(5000); 
-                if (!state->finished.load()) {
-                    uint16_t local_len;
-                    this->devices_[secondary_node]->read_object(
-                        ds_id, sizeof(secondary_remote_id),
-                        reinterpret_cast<const uint8_t *>(&secondary_remote_id),
-                        &local_len, state->secondary_buf.data());
-
-                    bool expected = false;
-                    if (state->finished.compare_exchange_strong(expected, true)) {
-                        state->final_data_len = local_len;
-                        state->winner_buf_ptr = state->secondary_buf.data();
-                        waitgroup_done(&state->wg);
-                    }
-                }
-                
-                // Custom GC: If I am the last entity touching this state, delete it
-                if (state->ref_count.fetch_sub(1) == 1) {
-                    delete state;
-                }
-            });
-        }
-       
-        // 4. Block mutator until the first read finishes
-        waitgroup_wait(&state->wg);
-
-        // 5. Safely copy the winning buffer to the live application memory
-        memcpy(obj_data_addr, state->winner_buf_ptr, state->final_data_len);
-        obj.init(ds_id, state->final_data_len, sizeof(obj_id), reinterpret_cast<uint8_t *>(&obj_id));
-        
-        // 6. Main thread is done. Decrement count, delete if it's the last one alive
-        if (state->ref_count.fetch_sub(1) == 1) {
-            delete state;
+    if (unlikely(local_len == 0)) {
+        // Primary failed/timed out. Fallback to secondary node sequentially.
+        uint16_t secondary_node = (primary_node + 1) % devices_.size();
+        this->devices_[secondary_node]->read_object(
+            ds_id, sizeof(remote_id),
+            reinterpret_cast<const uint8_t *>(&remote_id),
+            &local_len, obj_data_addr);
         }
     }
+
+    obj.init(ds_id, local_len, sizeof(remote_id), reinterpret_cast<uint8_t *>(&remote_id));
     // ========================================================================
-    // END HEDGED READ LOGIC
-    // ========================================================================
+
     wmb();
 
     if (!meta.is_shared()) {
@@ -529,36 +457,31 @@ void FarMemManager::swap_out(GenericFarMemPtr *ptr, Object obj) {
   }
   */
 
-  std::vector<FarMemPtrMeta::ReplicaLocation> new_replicas;
-
   auto write_object_fn = [&](uint32_t data_len) {
-    if (dirty) {
-      // Fire the simultaneous quorum write
-      new_replicas = write_object_quorum(ds_id, obj_id_len, obj_id, data_len, data_ptr);
+      if (dirty) {
+        write_object_quorum(ds_id, obj_id_len, obj_id, data_len, data_ptr);
+      }
+    };
+
+    if (auto evac_notifier = evac_notifiers_[ds_id]) {
+      if (evac_notifier(obj, write_object_fn)) { return; }
     } else {
-      // If the object isn't dirty, it's already in far memory. Keep existing replicas.
-      new_replicas = meta.get_replicas();
+      write_object_fn(obj.get_data_len());
     }
-  };
 
-  if (auto evac_notifier = evac_notifiers_[ds_id]) {
-    if (evac_notifier(obj, write_object_fn)) { // Ptr removed.
-      return;
+    // Safely extract the ID and call the pure scalar overload of gc_wb
+    uint64_t safe_obj_id = 0;
+    memcpy(&safe_obj_id, obj_id, std::min((size_t)obj_id_len, sizeof(uint64_t)));
+
+    if (!meta.is_shared()) {
+      meta.gc_wb(ds_id, obj_size, safe_obj_id);
+    } else {
+      reinterpret_cast<GenericSharedPtr *>(ptr)->traverse(
+          [=](GenericFarMemPtr *p) {
+            p->meta().gc_wb(ds_id, obj_size, safe_obj_id);
+          });
     }
-  } else {
-    write_object_fn(obj.get_data_len());
   }
-
-  // Finalize using the new gc_wb signature from pointer.cpp
-  if (!meta.is_shared()) {
-    meta.gc_wb(ds_id, obj_size, new_replicas);
-  } else {
-    reinterpret_cast<GenericSharedPtr *>(ptr)->traverse(
-        [=, &new_replicas](GenericFarMemPtr *p) {
-          p->meta().gc_wb(ds_id, obj_size, new_replicas);
-        });
-  }
-}
 
 /*
   A naive from-region picker according to the simple round-robin order.

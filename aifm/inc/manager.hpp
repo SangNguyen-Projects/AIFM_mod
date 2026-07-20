@@ -213,7 +213,7 @@ public:
   static void lock_object(uint8_t obj_id_len, const uint8_t *obj_id);
   static void unlock_object(uint8_t obj_id_len, const uint8_t *obj_id);
 
-  std::vector<FarMemPtrMeta::ReplicaLocation> write_object_quorum(
+  void write_object_quorum(
     uint8_t ds_id, uint8_t obj_id_len, const uint8_t *obj_id,
     uint16_t data_len, const uint8_t *data_buf);
 };
