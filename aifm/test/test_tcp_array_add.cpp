@@ -35,10 +35,11 @@ void copy_array(Array<T, N> *array, T *raw_array) {
   for (uint64_t i = 0; i < N; i++) {
     DerefScope scope;
     (*array).at_mut(scope, i) = raw_array[i];
-  }
-  
-  if(i % 10000000 == 0){
-    cout << "Copied " << i << " elements" << endl;
+
+    if(i % 10000000 == 0){
+      cout << "Copied " << i << " elements" << endl;
+    }
+    
   }
 }
 
@@ -49,10 +50,10 @@ void add_array(Array<T, N> *array_C, Array<T, N> *array_A,
     DerefScope scope;
     (*array_C).at_mut(scope, i) =
         (*array_A).at(scope, i) + (*array_B).at(scope, i);
-  }
 
-  if(i % 500000){
+    if(i % 500000){
       cout << "Added " << i << " elements" << endl;
+    }
   }
 }
 

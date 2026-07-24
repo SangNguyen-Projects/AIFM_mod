@@ -232,6 +232,11 @@ FarMemManagerFactory::build(uint64_t cache_size,
   if (unlikely(ptr_)) {
     return nullptr;
   }
+
+  if (unlikely(devices.empty())) {
+    return nullptr;
+  }
+  
   uint32_t num_gc_threads = optional_num_gc_threads.has_value()
                                 ? *optional_num_gc_threads
                                 : kDefaultNumGCThreads;
@@ -245,7 +250,7 @@ FarMemManagerFactory::build(uint64_t cache_size,
     far_mem_size += d->get_far_mem_size();
   }
   
-  N = std::min(static_cast<int>(devices.size()), 2);
+  int N = std::min(static_cast<int>(devices.size()), 2);
   far_mem_size = far_mem_size / N;
 
   ptr_ = new FarMemManager(cache_size, far_mem_size,

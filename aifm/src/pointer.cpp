@@ -188,7 +188,6 @@ retry:
   }
 
   other.meta().from_uint64_t(reset_value);
-  other.meta().clear_replicas();
   //__builtin_memcpy(reinterpret_cast<uint64_t *>(&other.meta()), &reset_value,
   //                 sizeof(reset_value));
 }
