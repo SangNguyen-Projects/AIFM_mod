@@ -32,6 +32,10 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+
+// Replication factor
+int N = 2;
+
 namespace far_memory {
 ObjLocker FarMemManager::obj_locker_;
 FarMemManager *FarMemManagerFactory::ptr_;
@@ -68,7 +72,8 @@ FarMemManager::FarMemManager(uint64_t cache_size, uint64_t far_mem_size,
   if (ksched_fd_ < 0) {
     LOG_PRINTF("%s\n", "Warn: fail to open /dev/ksched.");
   }
-  //memset(evac_notifiers_, 0, sizeof(evac_notifiers_));
+  
+  memset(evac_notifiers_, 0, sizeof(evac_notifiers_));
 
   for (uint8_t ds_id =
            std::numeric_limits<decltype(available_ds_ids_)::value_type>::min();
@@ -224,6 +229,9 @@ FarMemManagerFactory::build(uint64_t cache_size,
   for (auto* d : devices) {
     far_mem_size += d->get_far_mem_size();
   }
+  
+  N = std::min(static_cast<int>(devices.size()), 2);
+  far_mem_size = far_mem_size / N;
 
   ptr_ = new FarMemManager(cache_size, far_mem_size,
                            num_gc_threads, devices);
@@ -234,44 +242,47 @@ void FarMemManager::write_object_quorum(
     uint8_t ds_id, uint8_t obj_id_len, const uint8_t *obj_id,
     uint16_t data_len, const uint8_t *data_buf) {
     
-    // Set replication factor 
-    // Using std::min prevents setting N higher than the physical nodes you have.
-    int N = std::min(static_cast<int>(devices_.size()), 2); 
-    
     uint64_t remote_id = 0;
     memcpy(&remote_id, obj_id, std::min((size_t)obj_id_len, sizeof(uint64_t)));
     
-    uint16_t primary_node = remote_id % devices_.size();
+    // ========================================================================
+    // PARTITIONED ADDRESS TRANSLATION
+    // ========================================================================
+    uint64_t node_capacity = this->devices_[0]->get_far_mem_size();
+    uint64_t partition_size = node_capacity / N;
+
+    uint16_t primary_node = (remote_id / partition_size) % devices_.size();
+    uint64_t base_offset = remote_id % partition_size; 
+    // ========================================================================
 
     std::vector<uint16_t> target_nodes(N);
-
     waitgroup_t wg;
     waitgroup_init(&wg);
     
-    // Only wait for N - 1 threads, because the main thread handles the first write
     if (N > 1) {
         waitgroup_add(&wg, N - 1);
     }
 
-    // 1. Spawn background threads for replicas 1 through N-1
+    // 1. Spawn background threads for replicas
     for (int i = 1; i < N; i++) {
         target_nodes[i] = (primary_node + i) % devices_.size();
         uint16_t node_idx = target_nodes[i];
         
+        // Push the replica into the next partition block!
+        uint64_t replica_offset = base_offset + (i * partition_size);
         
-        rt::Spawn([this, node_idx, ds_id, obj_id_len, obj_id, data_len, data_buf, &wg]() {
+        rt::Spawn([this, node_idx, ds_id, replica_offset, data_len, data_buf, &wg]() {
                 this->devices_[node_idx]->write_object(
-                    ds_id, obj_id_len, obj_id, data_len, data_buf);
+                    ds_id, sizeof(replica_offset), reinterpret_cast<const uint8_t*>(&replica_offset), data_len, data_buf);
                 waitgroup_done(&wg);
         });
     }
 
-    // 2. Main thread: Write to primary node (index 0) synchronously
+    // 2. Main thread: Write to primary partition synchronously
     target_nodes[0] = primary_node;
     this->devices_[target_nodes[0]]->write_object(
-            ds_id, obj_id_len, obj_id, data_len, data_buf);
+            ds_id, sizeof(base_offset), reinterpret_cast<const uint8_t*>(&base_offset), data_len, data_buf);
 
-    // 3. Block until all background threads finish
     if (N > 1) {
         waitgroup_wait(&wg);
     }
@@ -334,28 +345,37 @@ void FarMemManager::swap_in(bool nt, GenericFarMemPtr *ptr) {
     auto obj_data_addr = reinterpret_cast<uint8_t *>(obj.get_data_addr());
 
     // ========================================================================
-    // READ LOGIC
+    // READ LOGIC (WITH PARTITIONED TRANSLATION)
     // ========================================================================
     uint64_t remote_id = 0;
     memcpy(&remote_id, &obj_id, std::min(sizeof(obj_id), sizeof(uint64_t)));
-    uint16_t primary_node = remote_id % devices_.size();
+    
+    uint64_t node_capacity = this->devices_[0]->get_far_mem_size();
+    uint64_t partition_size = node_capacity / N;
+
+    uint16_t primary_node = (remote_id / partition_size) % devices_.size();
+    uint64_t base_offset = remote_id % partition_size;
 
     uint16_t local_len = 0;
+    
+    // Read from the Primary Partition
     this->devices_[primary_node]->read_object(
-        ds_id, sizeof(remote_id),
-        reinterpret_cast<const uint8_t *>(&remote_id),
+        ds_id, sizeof(base_offset),
+        reinterpret_cast<const uint8_t *>(&base_offset),
         &local_len, obj_data_addr); 
 
     if (unlikely(local_len == 0)) {
-        // Primary failed/timed out. Fallback to secondary node sequentially.
+        // Fallback to secondary node's Replica Partition!
         uint16_t secondary_node = (primary_node + 1) % devices_.size();
+        uint64_t replica_offset = base_offset + partition_size;
+
         this->devices_[secondary_node]->read_object(
-            ds_id, sizeof(remote_id),
-            reinterpret_cast<const uint8_t *>(&remote_id),
+            ds_id, sizeof(replica_offset),
+            reinterpret_cast<const uint8_t *>(&replica_offset),
             &local_len, obj_data_addr);
-        }
     }
 
+    // Initialize using the original remote_id to keep global metadata intact
     obj.init(ds_id, local_len, sizeof(remote_id), reinterpret_cast<uint8_t *>(&remote_id));
     // ========================================================================
 
