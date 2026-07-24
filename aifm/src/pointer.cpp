@@ -44,24 +44,13 @@ void FarMemPtrMeta::gc_copy(uint64_t new_local_object_addr) {
 }
 
 void FarMemPtrMeta::gc_wb(uint8_t ds_id, uint16_t object_size, uint64_t obj_id) {
-  std::vector<ReplicaLocation> temp_replicas;
-  temp_replicas.push_back({0, obj_id});
-  gc_wb(ds_id, object_size, temp_replicas);
-}
-
-void FarMemPtrMeta::gc_wb(uint8_t ds_id, uint16_t object_size,
-                          const std::vector<ReplicaLocation>& new_replicas) {
-  
-  uint64_t obj_id = new_replicas.empty() ? 0 : new_replicas[0].object_id;
-                          
+  assert(obj_id < (1ULL << kObjectIDBitSize));
   auto new_metadata =
       (obj_id << kObjectIDBitPos) |
       (static_cast<uint64_t>(object_size) << kObjectSizeBitPos) |
       kPresentClear | ds_id;
   new_metadata |= (static_cast<uint64_t>(is_shared()) << kSharedBitPos);
   from_uint64_t(new_metadata);
-
-  replicas_ = new_replicas;
 }
 
 void GenericFarMemPtr::swap_in(bool nt) {
@@ -145,13 +134,9 @@ restart:
     //    reinterpret_cast<const uint8_t *>(obj.get_data_addr()));
 
     // 1. Fire the simultaneous quorum write
-    auto new_replicas = FarMemManagerFactory::get()->write_object_quorum(
+    FarMemManagerFactory::get()->write_object_quorum(
         obj.get_ds_id(), obj_id_len, obj_id_ptr, obj.get_data_len(),
         reinterpret_cast<const uint8_t *>(obj.get_data_addr()));
-        
-    // 2. Finalize the pointer with the new replica array
-    // (This calls the gc_wb function we rewrote earlier)
-    meta().gc_wb(obj.get_ds_id(), obj.size(), new_replicas);
 
     if (!meta_snapshot.is_shared()) {
       meta().clear_dirty();

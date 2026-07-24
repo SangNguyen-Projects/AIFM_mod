@@ -57,6 +57,21 @@ public:
 
 class FarMemManager {
 private:
+
+  static constexpr uint32_t kNumPartitions = 4096;
+  // Mask to isolate the bottom 38 bits of the AIFM remote pointer
+  static constexpr uint64_t kObjectIDMask = (1ULL << 38) - 1; 
+
+  // Maps a Partition ID to a list of N physical device indices
+  std::vector<std::vector<uint16_t>> partition_table_;
+
+  // Fast inline integer hash for distributing Virtual IDs
+  inline uint64_t hash_virtual_id(uint64_t x) const {
+      x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+      x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+      return x ^ (x >> 31);
+  }
+  
   constexpr static double kFreeCacheAlmostEmptyThresh = 0.03;
   constexpr static double kFreeCacheLowThresh = 0.12;
   constexpr static double kFreeCacheHighThresh = 0.22;

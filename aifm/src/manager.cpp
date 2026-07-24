@@ -32,10 +32,6 @@ extern "C" {
 #include <utility>
 #include <vector>
 
-
-// Replication factor
-int N = 2;
-
 namespace far_memory {
 ObjLocker FarMemManager::obj_locker_;
 FarMemManager *FarMemManagerFactory::ptr_;
@@ -67,6 +63,25 @@ FarMemManager::FarMemManager(uint64_t cache_size, uint64_t far_mem_size,
   for (auto* d : devices) {
     devices_.emplace_back(d);
   }
+
+  // ========================================================================
+  // INITIALIZE VIRTUAL PARTITION TABLE
+  // ========================================================================
+  partition_table_.resize(kNumPartitions);
+  
+  // Define replication factor (can be safely scaled up to devices_.size())
+  int N = std::min(static_cast<int>(devices_.size()), 2); 
+  
+  for (uint32_t p = 0; p < kNumPartitions; p++) {
+      // Use the hash to assign a pseudo-random base node for this partition
+      uint16_t base_node = hash_virtual_id(p) % devices_.size();
+      
+      // Assign N distinct nodes by walking cyclically
+      for (int i = 0; i < N; i++) {
+          partition_table_[p].push_back((base_node + i) % devices_.size());
+      }
+  }
+  // ========================================================================
 
   ksched_fd_ = open("/dev/ksched", O_RDWR);
   if (ksched_fd_ < 0) {
@@ -246,16 +261,15 @@ void FarMemManager::write_object_quorum(
     memcpy(&remote_id, obj_id, std::min((size_t)obj_id_len, sizeof(uint64_t)));
     
     // ========================================================================
-    // PARTITIONED ADDRESS TRANSLATION
+    // PARTITION-BASED ROUTING
     // ========================================================================
-    uint64_t node_capacity = this->devices_[0]->get_far_mem_size();
-    uint64_t partition_size = node_capacity / N;
-
-    uint16_t primary_node = (remote_id / partition_size) % devices_.size();
-    uint64_t base_offset = remote_id % partition_size; 
+    uint64_t true_obj_id = remote_id & kObjectIDMask;
+    uint32_t partition_id = hash_virtual_id(true_obj_id) % kNumPartitions;
+    
+    const auto& target_nodes = partition_table_[partition_id];
+    int N = target_nodes.size();
     // ========================================================================
 
-    std::vector<uint16_t> target_nodes(N);
     waitgroup_t wg;
     waitgroup_init(&wg);
     
@@ -263,25 +277,21 @@ void FarMemManager::write_object_quorum(
         waitgroup_add(&wg, N - 1);
     }
 
-    // 1. Spawn background threads for replicas
+    // 1. Spawn background threads for replicas 1 through N-1
+    // Pass the FULL remote_id so AIFM metadata bits are preserved on the server
     for (int i = 1; i < N; i++) {
-        target_nodes[i] = (primary_node + i) % devices_.size();
         uint16_t node_idx = target_nodes[i];
-        
-        // Push the replica into the next partition block!
-        uint64_t replica_offset = base_offset + (i * partition_size);
-        
-        rt::Spawn([this, node_idx, ds_id, replica_offset, data_len, data_buf, &wg]() {
+        rt::Spawn([this, node_idx, ds_id, remote_id, data_len, data_buf, &wg]() {
                 this->devices_[node_idx]->write_object(
-                    ds_id, sizeof(replica_offset), reinterpret_cast<const uint8_t*>(&replica_offset), data_len, data_buf);
+                    ds_id, sizeof(remote_id), reinterpret_cast<const uint8_t*>(&remote_id), data_len, data_buf);
                 waitgroup_done(&wg);
         });
     }
 
-    // 2. Main thread: Write to primary partition synchronously
-    target_nodes[0] = primary_node;
-    this->devices_[target_nodes[0]]->write_object(
-            ds_id, sizeof(base_offset), reinterpret_cast<const uint8_t*>(&base_offset), data_len, data_buf);
+    // 2. Main thread: Write to the Primary Node synchronously
+    uint16_t primary_node = target_nodes[0];
+    this->devices_[primary_node]->write_object(
+            ds_id, sizeof(remote_id), reinterpret_cast<const uint8_t*>(&remote_id), data_len, data_buf);
 
     if (N > 1) {
         waitgroup_wait(&wg);
@@ -345,37 +355,38 @@ void FarMemManager::swap_in(bool nt, GenericFarMemPtr *ptr) {
     auto obj_data_addr = reinterpret_cast<uint8_t *>(obj.get_data_addr());
 
     // ========================================================================
-    // READ LOGIC (WITH PARTITIONED TRANSLATION)
+    // READ LOGIC (PARTITION-BASED FALLBACK)
     // ========================================================================
     uint64_t remote_id = 0;
     memcpy(&remote_id, &obj_id, std::min(sizeof(obj_id), sizeof(uint64_t)));
     
-    uint64_t node_capacity = this->devices_[0]->get_far_mem_size();
-    uint64_t partition_size = node_capacity / N;
-
-    uint16_t primary_node = (remote_id / partition_size) % devices_.size();
-    uint64_t base_offset = remote_id % partition_size;
+    uint64_t true_obj_id = remote_id & kObjectIDMask;
+    uint32_t partition_id = hash_virtual_id(true_obj_id) % kNumPartitions;
+    
+    const auto& target_nodes = partition_table_[partition_id];
 
     uint16_t local_len = 0;
     
-    // Read from the Primary Partition
-    this->devices_[primary_node]->read_object(
-        ds_id, sizeof(base_offset),
-        reinterpret_cast<const uint8_t *>(&base_offset),
-        &local_len, obj_data_addr); 
-
-    if (unlikely(local_len == 0)) {
-        // Fallback to secondary node's Replica Partition!
-        uint16_t secondary_node = (primary_node + 1) % devices_.size();
-        uint64_t replica_offset = base_offset + partition_size;
-
-        this->devices_[secondary_node]->read_object(
-            ds_id, sizeof(replica_offset),
-            reinterpret_cast<const uint8_t *>(&replica_offset),
-            &local_len, obj_data_addr);
+    // Attempt to read from nodes sequentially (Primary, then Replicas)
+    for (size_t i = 0; i < target_nodes.size(); i++) {
+        uint16_t node_idx = target_nodes[i];
+        
+        this->devices_[node_idx]->read_object(
+            ds_id, sizeof(remote_id),
+            reinterpret_cast<const uint8_t *>(&remote_id),
+            &local_len, obj_data_addr); 
+            
+        // If data was returned, break out of the fallback loop
+        if (likely(local_len > 0)) {
+            break;
+        }
     }
 
-    // Initialize using the original remote_id to keep global metadata intact
+    if (unlikely(local_len == 0)) {
+        LOG_PRINTF("Warn: Total data loss detected for Object ID: %llu\n", true_obj_id);
+    }
+
+    // Initialize using the original, unmasked remote_id to keep metadata intact
     obj.init(ds_id, local_len, sizeof(remote_id), reinterpret_cast<uint8_t *>(&remote_id));
     // ========================================================================
 
